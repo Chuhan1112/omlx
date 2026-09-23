@@ -449,7 +449,89 @@ _LITERAL_CODE_HOLD = "__literal_code_hold__"
 _CODE_CONTEXT_TAIL_KEEP = 4096
 
 
-def _text_in_fenced_code(prefix: str) -> bool:
+def _balanced_fenced_code_intervals(text: str) -> List[Tuple[int, int]]:
+    intervals: List[Tuple[int, int]] = []
+    in_fence = False
+    fence_marker = ""
+    content_start = 0
+    cursor = 0
+
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip(" \t")
+        if not in_fence and (
+            stripped.startswith("```") or stripped.startswith("~~~")
+        ):
+            in_fence = True
+            fence_marker = stripped[:3]
+            content_start = cursor + len(line)
+        elif in_fence and stripped.startswith(fence_marker):
+            intervals.append((content_start, cursor))
+            in_fence = False
+        cursor += len(line)
+
+    return intervals
+
+
+def _balanced_inline_code_intervals(
+    text: str, fenced_intervals: List[Tuple[int, int]]
+) -> List[Tuple[int, int]]:
+    intervals: List[Tuple[int, int]] = []
+    fenced = sorted(fenced_intervals)
+    fence_index = 0
+    in_code = False
+    open_len = 0
+    run = 0
+    interval_start = 0
+    i = 0
+
+    while i < len(text):
+        if fence_index < len(fenced) and i >= fenced[fence_index][0]:
+            start, end = fenced[fence_index]
+            fence_index += 1
+            if i < end:
+                if in_code:
+                    in_code = False
+                    run = 0
+                i = end
+                continue
+
+        ch = text[i]
+        if ch == "`":
+            run += 1
+        else:
+            if run:
+                if not in_code:
+                    in_code = True
+                    open_len = run
+                    interval_start = i
+                elif run == open_len:
+                    intervals.append((interval_start, i - run))
+                    in_code = False
+                run = 0
+        i += 1
+
+    return intervals
+
+
+def _literal_code_marker_indices(text: str) -> set[int]:
+    fenced = _balanced_fenced_code_intervals(text)
+    inline = _balanced_inline_code_intervals(text, fenced)
+    indices: set[int] = set()
+
+    for start, end in fenced + inline:
+        idx = text.find(_GENERIC_TOOL_CALL_START, start, end)
+        while idx >= 0:
+            indices.add(idx)
+            idx = text.find(
+                _GENERIC_TOOL_CALL_START,
+                idx + len(_GENERIC_TOOL_CALL_START),
+                end,
+            )
+
+    return indices
+
+
+def _text_in_possible_fenced_code(prefix: str) -> bool:
     in_fence = False
     fence_marker = ""
     for line in prefix.splitlines(keepends=True):
@@ -464,42 +546,7 @@ def _text_in_fenced_code(prefix: str) -> bool:
     return in_fence
 
 
-def _fenced_code_marker_before(prefix: str) -> str:
-    in_fence = False
-    fence_marker = ""
-    for line in prefix.splitlines(keepends=True):
-        stripped = line.lstrip(" \t")
-        if in_fence:
-            if stripped.startswith(fence_marker):
-                in_fence = False
-                fence_marker = ""
-        elif stripped.startswith("```") or stripped.startswith("~~~"):
-            in_fence = True
-            fence_marker = stripped[:3]
-    return fence_marker if in_fence else ""
-
-
-def _last_fenced_code_end(prefix: str) -> int:
-    in_fence = False
-    fence_marker = ""
-    cursor = 0
-    end = 0
-
-    for line in prefix.splitlines(keepends=True):
-        stripped = line.lstrip(" \t")
-        if in_fence:
-            if stripped.startswith(fence_marker):
-                in_fence = False
-                end = cursor + len(line)
-        elif stripped.startswith("```") or stripped.startswith("~~~"):
-            in_fence = True
-            fence_marker = stripped[:3]
-        cursor += len(line)
-
-    return end
-
-
-def _text_in_inline_code(text: str, idx: int) -> bool:
+def _text_in_possible_inline_code(text: str, idx: int) -> bool:
     in_code = False
     open_len = 0
     run = 0
@@ -519,35 +566,6 @@ def _text_in_inline_code(text: str, idx: int) -> bool:
             run = 0
 
     return in_code
-
-
-def _generic_marker_in_code_context(
-    text: str, idx: int, *, require_close: bool = True
-) -> bool:
-    prefix = text[:idx]
-    fence_marker = _fenced_code_marker_before(prefix)
-    if fence_marker:
-        if not require_close:
-            return True
-        for line in text[idx:].splitlines(keepends=True):
-            if line.lstrip(" \t").startswith(fence_marker):
-                return True
-        return False
-    inline_start = _last_fenced_code_end(prefix)
-    inline_prefix = text[inline_start:idx]
-    if not _text_in_inline_code(inline_prefix, len(inline_prefix)):
-        return False
-    if not require_close:
-        return True
-    open_len = 0
-    cursor = idx - 1
-    while cursor >= inline_start and text[cursor] == "`":
-        open_len += 1
-        cursor -= 1
-    if not open_len:
-        return False
-    closing = "`" * open_len
-    return re.search(re.escape(closing) + "(?!`)", text[idx:]) is not None
 
 
 # Candidate envelope ends examined before giving up. Each candidate costs a
@@ -604,10 +622,11 @@ def _wrap_naked_function_calls(text: str) -> str | None:
     parts = []
     pos = 0
     recovered = False
+    code_markers = _literal_code_marker_indices(text)
     while match := _QWEN_OPEN_RE.search(text, pos):
         if (
             match.group() == _GENERIC_TOOL_CALL_START
-            and _generic_marker_in_code_context(text, match.start())
+            and match.start() in code_markers
         ):
             parts.append(text[pos : match.end()])
             pos = match.end()
@@ -882,13 +901,18 @@ def _iter_marker_spans(
     behaviour this replaces.
     """
     pos = 0
+    code_markers = (
+        _literal_code_marker_indices(text)
+        if start_marker == _GENERIC_TOOL_CALL_START
+        else set()
+    )
     while True:
         start = text.find(start_marker, pos)
         if start < 0:
             return
         if (
             start_marker == _GENERIC_TOOL_CALL_START
-            and _generic_marker_in_code_context(text, start)
+            and start in code_markers
         ):
             pos = start + len(start_marker)
             continue
@@ -2291,35 +2315,44 @@ def sanitize_tool_call_markup(
     )
     cleaned = stream_filter.feed(text)
     cleaned += stream_filter.finish()
-    literal_candidate = stream_filter.take_literal_code_candidate()
-    if literal_candidate and literal_code_candidate_is_safe(text):
-        cleaned += literal_candidate
+    if _GENERIC_TOOL_CALL_START in text and literal_code_candidate_is_safe(text):
+        return text.strip()
     return cleaned.strip()
 
 
 def literal_code_candidate_is_safe(text: str) -> bool:
-    markers = (
-        _GENERIC_TOOL_CALL_START,
+    other_markers = (
         "<function",
         "<|tool_call_start|>",
         "<|tool_call>",
         "<|im_start|>",
         ":tool_call>",
     )
-    for marker in markers:
-        idx = 0
-        while True:
-            idx = text.find(marker, idx)
-            if idx < 0:
-                break
-            if (
-                marker == _GENERIC_TOOL_CALL_START
-                and _generic_marker_in_code_context(text, idx)
-            ):
-                idx += len(marker)
-                continue
+    if any(marker in text for marker in other_markers):
+        return False
+
+    code_markers = _literal_code_marker_indices(text)
+    for match in re.finditer(re.escape(_GENERIC_TOOL_CALL_START), text):
+        if match.start() not in code_markers:
             return False
     return True
+
+
+def literal_code_recovery_suffix(
+    cleaned_text: str, streamed_text: str, failed: bool
+) -> str:
+    """Return prose withheld by streaming only after final parsing clears it."""
+
+    if failed or not cleaned_text.startswith(streamed_text):
+        return ""
+    suffix = cleaned_text[len(streamed_text) :]
+    if (
+        not suffix
+        or _GENERIC_TOOL_CALL_START not in suffix
+        or not literal_code_candidate_is_safe(cleaned_text)
+    ):
+        return ""
+    return suffix
 
 
 def _extract_tool_names(tools: List) -> set:
@@ -2345,11 +2378,12 @@ def parse_qwen_tool_calls(
     """
     calls, prose, errors = [], [], []
     pos = 0
+    code_markers = _literal_code_marker_indices(text)
     while match := _QWEN_OPEN_RE.search(text, pos):
         start = match.start()
         prose.append(text[pos:start])
         paired = match.group() == "<tool_call>"
-        if paired and _generic_marker_in_code_context(text, start):
+        if paired and start in code_markers:
             prose.append(match.group())
             pos = match.end()
             continue
@@ -3065,6 +3099,12 @@ class ToolCallStreamFilter:
             return hit
 
         starts: List[Tuple[int, int, Optional[str]]] = []
+        fence_possible = (
+            "```" in self._code_context_tail
+            or "```" in text
+            or "~~~" in self._code_context_tail
+            or "~~~" in text
+        )
 
         for marker, close in self._marker_pairs:
 
@@ -3074,9 +3114,20 @@ class ToolCallStreamFilter:
                 idx = text.find(marker, start)
                 if idx >= 0 and marker == _GENERIC_TOOL_CALL_START:
                     context = self._code_context_tail + text[:idx]
-                    if _generic_marker_in_code_context(
-                        context, len(context), require_close=False
-                    ):
+                    inline_possible = "`" in context
+                    literal_hint = (
+                        (
+                            inline_possible
+                            and _text_in_possible_inline_code(
+                                context, len(context)
+                            )
+                        )
+                        or (
+                            fence_possible
+                            and _text_in_possible_fenced_code(context)
+                        )
+                    )
+                    if literal_hint:
                         return (idx, len(marker), _LITERAL_CODE_HOLD)
                 return None if idx < 0 else (idx, len(marker), close)
 
