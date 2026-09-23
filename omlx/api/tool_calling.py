@@ -444,101 +444,12 @@ _XML_FUNCTION_OPEN = "<function="
 _XML_FUNCTION_CLOSE = "</function>"
 _XML_PARAMETER_OPEN = "<parameter="
 _XML_PARAMETER_CLOSE = "</parameter>"
-_GENERIC_TOOL_CALL_START = "<" "tool_call" ">"
 # Candidate envelope ends examined before giving up. Each candidate costs a
 # balance count over the payload, so this keeps hostile output linear.
 _XML_MAX_END_CANDIDATES = 32
 # Trailing payload context the stream filter keeps so a `</function>` split
 # across chunks is still visible when the close marker arrives.
 _XML_TAIL_KEEP = 64
-
-
-class _ToolCallPayloadPrefix:
-    """Classify a generic ``<tool_call>`` payload before suppressing it.
-
-    ``<tool_call>`` is also common in explanatory prose. Hold the envelope
-    briefly until its payload has either established a recognized call shape
-    or become impossible to parse as one. Structured but malformed calls
-    remain suppressed: they are control markup, not user-facing prose.
-    """
-
-    def __init__(self, tool_names: set[str] | None = None):
-        self._tool_names = tool_names or set()
-        self._name_parts: List[str] = []
-        self._known_name = False
-        self._state = "start"
-        self._tag = ""
-        self._tags: Tuple[str, ...] = ()
-        self.decision: bool | None = None
-
-    def feed(self, text: str, start: int = 0) -> bool | None:
-        for i in range(start, len(text)):
-            if self.decision is not None:
-                break
-            ch = text[i]
-            if self._state == "tag":
-                if self._tag == "<function" and ch.isspace():
-                    self.decision = True
-                    break
-                self._tag += ch
-                if self._tag in self._tags:
-                    self.decision = True
-                elif not any(tag.startswith(self._tag) for tag in self._tags):
-                    self.decision = False
-            elif self._state == "start":
-                if ch.isspace():
-                    continue
-                if ch in "{[":
-                    self.decision = True
-                elif ch == "<":
-                    self._state, self._tag = "tag", "<"
-                    self._tags = ("<function=",)
-                elif ch.isalnum() or ch in "_.:-":
-                    self._state = "name"
-                    if self._tool_names:
-                        self._name_parts.append(ch)
-                else:
-                    self.decision = False
-            elif self._state == "name":
-                if ch.isalnum() or ch in "_.:-":
-                    if self._tool_names:
-                        self._name_parts.append(ch)
-                    continue
-                self._known_name = "".join(self._name_parts) in self._tool_names
-                if ch.isspace():
-                    self._state = "arguments"
-                elif ch == "<":
-                    self._state, self._tag = "tag", "<"
-                    self._tags = ("<arg_key>", "</tool_call>")
-                else:
-                    self.decision = False
-            elif self._state == "arguments":
-                if ch.isspace():
-                    continue
-                if ch == "{":
-                    self.decision = True
-                elif ch == "<":
-                    self._state, self._tag = "tag", "<"
-                    self._tags = ("<arg_key>", "</tool_call>")
-                elif self._known_name and (ch.isalnum() or ch in "_\"'"):
-                    self.decision = True
-                elif ch.isalnum() or ch in "_.-":
-                    self._state = "key"
-                else:
-                    self.decision = False
-            elif self._state == "key":
-                if ch == "=":
-                    self.decision = True
-                elif not (ch.isalnum() or ch in "_.-"):
-                    self.decision = False
-        return self.decision
-
-    def finish(self) -> bool:
-        # An incomplete XML tag may be a truncated call; a bare word is prose.
-        return self.decision if self.decision is not None else self._state == "tag"
-
-    def is_registered_name(self) -> bool:
-        return bool(self._tool_names) and "".join(self._name_parts) in self._tool_names
 
 
 class _NakedFunctionBoundary:
@@ -582,19 +493,13 @@ class _NakedFunctionBoundary:
 _QWEN_OPEN_RE = re.compile(r"<tool_call>|<function=[^\s>]+>")
 
 
-def _wrap_naked_function_calls(
-    text: str, tool_names: set[str] | None = None
-) -> str | None:
+def _wrap_naked_function_calls(text: str) -> str | None:
     """Restore missing wrappers, leaving existing envelopes and prose intact."""
     parts = []
     pos = 0
     recovered = False
     while match := _QWEN_OPEN_RE.search(text, pos):
         if match.group() == "<tool_call>":
-            if _ToolCallPayloadPrefix(tool_names).feed(text, match.end()) is False:
-                parts.append(text[pos : match.end()])
-                pos = match.end()
-                continue
             found = _find_marker_span_end(text, match.end(), "</tool_call>")
             if found is None:
                 break
@@ -854,10 +759,7 @@ def _find_marker_span_end(
 
 
 def _iter_marker_spans(
-    text: str,
-    start_marker: str,
-    end_marker: str,
-    tool_names: set[str] | None = None,
+    text: str, start_marker: str, end_marker: str
 ) -> Iterator[Tuple[int, int, str]]:
     """Yield ``(span_start, span_end, payload)`` for each marker-delimited call.
 
@@ -872,12 +774,6 @@ def _iter_marker_spans(
         if start < 0:
             return
         payload_start = start + len(start_marker)
-        if (
-            start_marker == "<tool_call>"
-            and _ToolCallPayloadPrefix(tool_names).feed(text, payload_start) is False
-        ):
-            pos = payload_start
-            continue
         found = _find_marker_span_end(text, payload_start, end_marker)
         if found is None:
             return
@@ -886,27 +782,12 @@ def _iter_marker_spans(
         pos = span_end
 
 
-def _marker_payloads(
-    text: str,
-    start_marker: str,
-    end_marker: str,
-    tool_names: set[str] | None = None,
-) -> List[str]:
+def _marker_payloads(text: str, start_marker: str, end_marker: str) -> List[str]:
     """Payloads of every complete marker-delimited tool call, in order."""
-    return [
-        payload
-        for _s, _e, payload in _iter_marker_spans(
-            text, start_marker, end_marker, tool_names
-        )
-    ]
+    return [payload for _s, _e, payload in _iter_marker_spans(text, start_marker, end_marker)]
 
 
-def _strip_marker_spans(
-    text: str,
-    start_marker: str,
-    end_marker: str,
-    tool_names: set[str] | None = None,
-) -> str:
+def _strip_marker_spans(text: str, start_marker: str, end_marker: str) -> str:
     """Remove every complete marker-delimited span, keeping surrounding prose.
 
     Span-based rather than ``re.sub`` with a non-greedy pattern so that a call
@@ -916,7 +797,7 @@ def _strip_marker_spans(
     out: List[str] = []
     last = 0
     for span_start, span_end, _payload in _iter_marker_spans(
-        text, start_marker, end_marker, tool_names
+        text, start_marker, end_marker
     ):
         out.append(text[last:span_start])
         last = span_end
@@ -943,8 +824,7 @@ def _parse_xml_tool_calls(
         Tuple of (cleaned_text, tool_calls or None)
     """
     tool_calls = []
-    tool_names = _extract_tool_names(tools or [])
-    matches = _marker_payloads(text, "<tool_call>", "</tool_call>", tool_names)
+    matches = _marker_payloads(text, "<tool_call>", "</tool_call>")
 
     for match in matches:
         content = match.strip()
@@ -1030,9 +910,7 @@ def _parse_xml_tool_calls(
         return text, None
 
     # Remove tool call tags from text
-    cleaned = _strip_marker_spans(
-        text, "<tool_call>", "</tool_call>", tool_names
-    ).strip()
+    cleaned = _strip_marker_spans(text, "<tool_call>", "</tool_call>").strip()
     return cleaned, tool_calls
 
 
@@ -2073,8 +1951,7 @@ def _parse_tool_calls_impl(
             return "".join(prose).strip(), attr_calls + (calls or [])
 
     # Recover missing outer wrappers through the same schema-aware XML path.
-    tool_names = _extract_tool_names(tools or [])
-    normalized = _wrap_naked_function_calls(cleaned_text, tool_names)
+    normalized = _wrap_naked_function_calls(cleaned_text)
     if normalized is not None:
         return _parse_xml_tool_calls(normalized, tools)
 
@@ -2092,9 +1969,7 @@ def _parse_tool_calls_impl(
                 # Paired markers (e.g. <tool_call>...</tool_call>).  Span-based
                 # rather than a non-greedy regex so an argument containing a
                 # literal close marker does not truncate the payload (#2507).
-                matches = _marker_payloads(
-                    text, tool_call_start, tool_call_end, tool_names
-                )
+                matches = _marker_payloads(text, tool_call_start, tool_call_end)
             else:
                 # One-sided marker (e.g. Mistral/Devstral "[TOOL_CALLS]"):
                 # split on the start marker and parse each segment.
@@ -2206,7 +2081,7 @@ def _parse_tool_calls_impl(
             if tool_calls:
                 if tool_call_end:
                     cleaned_text = _strip_marker_spans(
-                        cleaned_text, tool_call_start, tool_call_end, tool_names
+                        cleaned_text, tool_call_start, tool_call_end
                     ).strip()
                 else:
                     # One-sided: everything from first marker to end is tool calls
@@ -2327,13 +2202,6 @@ def parse_qwen_tool_calls(
         start = match.start()
         prose.append(text[pos:start])
         paired = match.group() == "<tool_call>"
-        if paired:
-            prefix = _ToolCallPayloadPrefix(_extract_tool_names(tools))
-            prefix.feed(text, match.end())
-            if prefix.finish() is False:
-                prose.append(match.group())
-                pos = match.end()
-                continue
         found = (
             _find_marker_span_end(text, match.end(), "</tool_call>") if paired else None
         )
@@ -2656,8 +2524,6 @@ class ToolCallStreamFilter:
         self._buffer = ""
         self._suppressing_until: Optional[str] = None
         self._suppressing = False
-        self._generic_prefix: Optional[_ToolCallPayloadPrefix] = None
-        self._generic_scan_off = 0
         self._pending_envelope_parts: List[str] = []
         self._pending_start_marker: Optional[str] = None
         self._recovery_candidate = ""
@@ -2768,8 +2634,6 @@ class ToolCallStreamFilter:
     def _clear_pending_envelope(self) -> None:
         self._pending_envelope_parts = []
         self._pending_start_marker = None
-        self._generic_prefix = None
-        self._generic_scan_off = 0
         self._reset_json_scan()
 
     # -- Incremental JSON scan over a suppressed payload (#2507) ------------
@@ -2804,7 +2668,6 @@ class ToolCallStreamFilter:
 
     def _shift_json_scan(self, dropped: int, moved: str = "") -> None:
         """Rebase scan offsets after ``dropped`` chars leave the buffer front."""
-        self._generic_scan_off = max(0, self._generic_scan_off - dropped)
         self._naked_scan_off = max(0, self._naked_scan_off - dropped)
         self._json_scan_off = max(0, self._json_scan_off - dropped)
         self._json_complete_off = max(0, self._json_complete_off - dropped)
@@ -3044,15 +2907,6 @@ class ToolCallStreamFilter:
                 marker: str = marker, close: str = close
             ) -> Optional[Tuple[int, int, Optional[str]]]:
                 idx = text.find(marker, start)
-                while idx >= 0 and marker == "<tool_call>":
-                    if (
-                        _ToolCallPayloadPrefix(self._registered_tool_names).feed(
-                            text, idx + len(marker)
-                        )
-                        is not False
-                    ):
-                        break
-                    idx = text.find(marker, idx + len(marker))
                 return None if idx < 0 else (idx, len(marker), close)
 
             hit = lookup(("pair", marker), compute_pair)
@@ -3431,9 +3285,6 @@ class ToolCallStreamFilter:
             return text
 
         self._buffer += text
-        return self._drain_buffer()
-
-    def _drain_buffer(self) -> str:
         out: List[str] = []
 
         while self._buffer:
@@ -3454,23 +3305,6 @@ class ToolCallStreamFilter:
                 break
 
             if self._suppressing_until is not None:
-                if (
-                    self._pending_start_marker == "<tool_call>"
-                    and self._generic_prefix is not None
-                ):
-                    decision = self._generic_prefix.feed(
-                        self._buffer, self._generic_scan_off
-                    )
-                    self._generic_scan_off = len(self._buffer)
-                    if decision is False:
-                        self._record_content(out, self._pending_start_marker)
-                        self._buffer = (
-                            "".join(self._pending_envelope_parts[1:])
-                            + self._buffer
-                        )
-                        self._suppressing_until = None
-                        self._clear_pending_envelope()
-                        continue
                 end_idx = self._find_suppression_end(self._buffer)
                 if end_idx < 0:
                     if (
@@ -3538,11 +3372,6 @@ class ToolCallStreamFilter:
                         # namespace markers, if the matching close never arrives.
                         self._pending_envelope_parts = [opening_marker]
                         self._pending_start_marker = opening_marker
-                        if opening_marker == "<tool_call>":
-                            self._generic_prefix = _ToolCallPayloadPrefix(
-                                self._registered_tool_names
-                            )
-                            self._generic_scan_off = 0
                         # Fresh envelope: start the payload scan from scratch.
                         self._reset_json_scan()
                 continue
@@ -3576,40 +3405,23 @@ class ToolCallStreamFilter:
             if stripped == "</tool_call>":
                 self._buffer = ""
             self._after_naked_function = False
-
-        recovered = ""
-        if (
-            self._pending_start_marker == _GENERIC_TOOL_CALL_START
-            and self._generic_prefix is not None
-            and self._registered_tool_names
-            and self._generic_prefix.finish() is False
-            and not self._generic_prefix.is_registered_name()
-        ):
-            candidate = "".join(self._pending_envelope_parts) + self._buffer
-            start_marker = self._pending_start_marker or ""
-            self._buffer = candidate[len(start_marker) :]
-            self._suppressing_until = None
-            self._clear_pending_envelope()
-            recovered = start_marker + self._drain_buffer()
-            if self._suppressing:
-                return recovered
-
         if self._ifm_pending_parts is not None:
             raw = "".join(self._ifm_pending_parts)
             self._ifm_pending_parts = None
             cleaned, _ = _parse_k2_tool_calls(raw)
-            return recovered + cleaned
+            return cleaned
         if self._suppressing:
             self._buffer = ""
             self._suppressing_until = None
             self._clear_pending_envelope()
-            return recovered
+            return ""
 
         # An envelope still suppressing at EOF means the payload scan never
         # confirmed where the value ends.  A literal close marker is then the
         # best evidence available, so trust it rather than withholding to EOF:
         # prose the model resumed after the envelope survives, as it did before
         # the #2507 span scanning.
+        recovered = ""
         if self._suppressing_until is not None:
             marker = self._suppressing_until
             self._pending_envelope_parts.append(self._buffer)

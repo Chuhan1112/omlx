@@ -1961,7 +1961,7 @@ class TestParseToolCallsSyntaxError:
             raise SyntaxError("invalid syntax (<unknown>, line 1)")
 
         tok = self._qwen_tok(failing_parser)
-        text = '<tool_call>{"name":</tool_call>'
+        text = "<tool_call>not a function at all, just text</tool_call>"
 
         with caplog.at_level(logging.WARNING, logger="omlx.api.tool_calling"):
             cleaned, tool_calls = parse_tool_calls(text, tok)
@@ -5358,92 +5358,6 @@ def test_attribute_cdata_does_not_select_an_embedded_dialect(value):
     assert len(calls) == 1
     assert calls[0].function.name == "read"
     assert json.loads(calls[0].function.arguments) == {"path": value}
-
-
-class TestLiteralGenericToolCallMarkers:
-    """Regression coverage for #3794 and the #3834 malformed-call leak."""
-
-    TOOLS = [{"type": "function", "function": {"name": "write"}}]
-
-    @pytest.mark.parametrize(
-        "raw",
-        [
-            "The \x3ctool_call\x3e marker",
-            "A raw \x3ctool_call\x3e\nexample",
-            "Use \x3ctool_call\x3e in prose",
-        ],
-    )
-    @pytest.mark.parametrize("chunk_size", [0, 1, 5])
-    def test_literal_marker_at_eof_stream_and_parse_as_prose(
-        self, raw, chunk_size
-    ):
-        tokenizer = _make_tokenizer()
-        stream = ToolCallStreamFilter(tokenizer, tools=self.TOOLS)
-
-        visible = _feed_chunked(stream, raw, chunk_size) + stream.finish()
-        cleaned, calls = parse_tool_calls(raw, tokenizer, self.TOOLS)
-
-        assert visible == raw
-        assert stream.take_recovery_candidate() == ""
-        assert cleaned == raw
-        assert calls is None
-
-    @pytest.mark.parametrize("chunk_size", [0, 1, 5])
-    def test_registered_bare_name_at_eof_remains_suppressed(self, chunk_size):
-        raw = "A raw \x3ctool_call\x3e\nwrite"
-        stream = ToolCallStreamFilter(_make_tokenizer(), tools=self.TOOLS)
-
-        visible = _feed_chunked(stream, raw, chunk_size) + stream.finish()
-
-        assert visible == "A raw "
-        assert stream.take_recovery_candidate() == "\x3ctool_call\x3e\nwrite"
-
-    @pytest.mark.parametrize(
-        "raw",
-        [
-            "Use `<tool_call>` literally.",
-            "Example:\n```\n<tool_call>\nwrite\n```\nDone.",
-            "The <tool_call> marker starts a call.",
-        ],
-    )
-    @pytest.mark.parametrize("chunk_size", [0, 1, 7])
-    def test_literal_markers_stream_and_parse_as_prose(self, raw, chunk_size):
-        tokenizer = _make_tokenizer()
-        stream = ToolCallStreamFilter(tokenizer, tools=self.TOOLS)
-
-        visible = _feed_chunked(stream, raw, chunk_size) + stream.finish()
-        cleaned, calls = parse_tool_calls(raw, tokenizer, self.TOOLS)
-
-        assert visible == raw
-        assert cleaned == raw
-        assert calls is None
-
-    @pytest.mark.parametrize("chunk_size", [0, 1, 5])
-    def test_literal_marker_does_not_hide_a_later_call(self, chunk_size):
-        literal = "Use `<tool_call>` literally. "
-        call = '<tool_call>{"name":"write","arguments":{}}</tool_call>'
-        trailing = " Done."
-        raw = literal + call + trailing
-        tokenizer = _make_tokenizer()
-        stream = ToolCallStreamFilter(tokenizer, tools=self.TOOLS)
-
-        visible = _feed_chunked(stream, raw, chunk_size) + stream.finish()
-        cleaned, calls = parse_tool_calls(raw, tokenizer, self.TOOLS)
-
-        assert visible == literal + trailing
-        assert cleaned == literal + trailing
-        assert len(calls) == 1
-        assert calls[0].function.name == "write"
-
-    @pytest.mark.parametrize("chunk_size", [0, 1, 5])
-    def test_malformed_structured_call_remains_hidden(self, chunk_size):
-        raw = '<tool_call>{"name":</tool_call>'
-        stream = ToolCallStreamFilter(_make_tokenizer(), tools=self.TOOLS)
-
-        visible = _feed_chunked(stream, raw, chunk_size) + stream.finish()
-
-        assert visible == ""
-        assert sanitize_tool_call_markup(raw, _make_tokenizer(), self.TOOLS) == ""
 
 
 @pytest.mark.parametrize("dialect", ["json", "qwen", "namespaced"])
