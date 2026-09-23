@@ -445,6 +445,8 @@ _XML_FUNCTION_CLOSE = "</function>"
 _XML_PARAMETER_OPEN = "<parameter="
 _XML_PARAMETER_CLOSE = "</parameter>"
 _GENERIC_TOOL_CALL_START = "<" "tool_call" ">"
+_LITERAL_CODE_HOLD = "__literal_code_hold__"
+_CODE_CONTEXT_TAIL_KEEP = 4096
 
 
 def _text_in_fenced_code(prefix: str) -> bool:
@@ -462,10 +464,90 @@ def _text_in_fenced_code(prefix: str) -> bool:
     return in_fence
 
 
-def _generic_marker_in_code_context(text: str, idx: int) -> bool:
-    if idx > 0 and text[idx - 1] == "`":
+def _fenced_code_marker_before(prefix: str) -> str:
+    in_fence = False
+    fence_marker = ""
+    for line in prefix.splitlines(keepends=True):
+        stripped = line.lstrip(" \t")
+        if in_fence:
+            if stripped.startswith(fence_marker):
+                in_fence = False
+                fence_marker = ""
+        elif stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = True
+            fence_marker = stripped[:3]
+    return fence_marker if in_fence else ""
+
+
+def _last_fenced_code_end(prefix: str) -> int:
+    in_fence = False
+    fence_marker = ""
+    cursor = 0
+    end = 0
+
+    for line in prefix.splitlines(keepends=True):
+        stripped = line.lstrip(" \t")
+        if in_fence:
+            if stripped.startswith(fence_marker):
+                in_fence = False
+                end = cursor + len(line)
+        elif stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = True
+            fence_marker = stripped[:3]
+        cursor += len(line)
+
+    return end
+
+
+def _text_in_inline_code(text: str, idx: int) -> bool:
+    in_code = False
+    open_len = 0
+    run = 0
+
+    for i, ch in enumerate(text):
+        if i == idx:
+            return in_code
+        if ch == "`":
+            run += 1
+            if not in_code:
+                in_code = True
+                open_len = run
+            continue
+        if run:
+            if in_code and run == open_len:
+                in_code = False
+            run = 0
+
+    return in_code
+
+
+def _generic_marker_in_code_context(
+    text: str, idx: int, *, require_close: bool = True
+) -> bool:
+    prefix = text[:idx]
+    fence_marker = _fenced_code_marker_before(prefix)
+    if fence_marker:
+        if not require_close:
+            return True
+        for line in text[idx:].splitlines(keepends=True):
+            if line.lstrip(" \t").startswith(fence_marker):
+                return True
+        return False
+    inline_start = _last_fenced_code_end(prefix)
+    inline_prefix = text[inline_start:idx]
+    if not _text_in_inline_code(inline_prefix, len(inline_prefix)):
+        return False
+    if not require_close:
         return True
-    return _text_in_fenced_code(text[:idx])
+    open_len = 0
+    cursor = idx - 1
+    while cursor >= inline_start and text[cursor] == "`":
+        open_len += 1
+        cursor -= 1
+    if not open_len:
+        return False
+    closing = "`" * open_len
+    return re.search(re.escape(closing) + "(?!`)", text[idx:]) is not None
 
 
 # Candidate envelope ends examined before giving up. Each candidate costs a
@@ -2209,7 +2291,35 @@ def sanitize_tool_call_markup(
     )
     cleaned = stream_filter.feed(text)
     cleaned += stream_filter.finish()
+    literal_candidate = stream_filter.take_literal_code_candidate()
+    if literal_candidate and literal_code_candidate_is_safe(text):
+        cleaned += literal_candidate
     return cleaned.strip()
+
+
+def literal_code_candidate_is_safe(text: str) -> bool:
+    markers = (
+        _GENERIC_TOOL_CALL_START,
+        "<function",
+        "<|tool_call_start|>",
+        "<|tool_call>",
+        "<|im_start|>",
+        ":tool_call>",
+    )
+    for marker in markers:
+        idx = 0
+        while True:
+            idx = text.find(marker, idx)
+            if idx < 0:
+                break
+            if (
+                marker == _GENERIC_TOOL_CALL_START
+                and _generic_marker_in_code_context(text, idx)
+            ):
+                idx += len(marker)
+                continue
+            return False
+    return True
 
 
 def _extract_tool_names(tools: List) -> set:
@@ -2239,6 +2349,10 @@ def parse_qwen_tool_calls(
         start = match.start()
         prose.append(text[pos:start])
         paired = match.group() == "<tool_call>"
+        if paired and _generic_marker_in_code_context(text, start):
+            prose.append(match.group())
+            pos = match.end()
+            continue
         found = (
             _find_marker_span_end(text, match.end(), "</tool_call>") if paired else None
         )
@@ -2561,10 +2675,8 @@ class ToolCallStreamFilter:
         self._buffer = ""
         self._suppressing_until: Optional[str] = None
         self._suppressing = False
-        self._in_fenced_code = False
-        self._fence_marker = ""
-        self._line_buffer = ""
-        self._last_visible_char = ""
+        self._code_context_tail = ""
+        self._literal_code_candidate = ""
         self._pending_envelope_parts: List[str] = []
         self._pending_start_marker: Optional[str] = None
         self._recovery_candidate = ""
@@ -2597,6 +2709,13 @@ class ToolCallStreamFilter:
         """
         candidate = self._recovery_candidate
         self._recovery_candidate = ""
+        return candidate
+
+    def take_literal_code_candidate(self) -> str:
+        """Return a code-context marker held until final parsing."""
+
+        candidate = self._literal_code_candidate
+        self._literal_code_candidate = ""
         return candidate
 
     def take_completed_envelopes(self) -> List[str]:
@@ -2636,34 +2755,12 @@ class ToolCallStreamFilter:
             or self._ifm_pending_parts is not None
         )
 
-    def _update_visible_code_context(self, text: str) -> None:
-        """Track the two literal-marker contexts we can identify reliably."""
-
-        for ch in text:
-            self._last_visible_char = ch
-            if self._in_fenced_code:
-                self._line_buffer += ch
-                if ch == "\n":
-                    stripped = self._line_buffer.lstrip(" \t")
-                    if stripped.startswith(self._fence_marker):
-                        self._in_fenced_code = False
-                        self._fence_marker = ""
-                    self._line_buffer = ""
-                continue
-
-            if ch == "\n":
-                stripped = self._line_buffer.lstrip(" \t")
-                if stripped.startswith("```") or stripped.startswith("~~~"):
-                    self._in_fenced_code = True
-                    self._fence_marker = stripped[:3]
-                self._line_buffer = ""
-            else:
-                self._line_buffer += ch
-
     def _record_content(self, out: List[str], text: str) -> None:
         if not text:
             return
-        self._update_visible_code_context(text)
+        self._code_context_tail = (
+            self._code_context_tail + text
+        )[-_CODE_CONTEXT_TAIL_KEEP:]
         out.append(text)
         if self._capture_ordered_segments:
             self._ordered_segments.append(ToolCallStreamSegment("content", text))
@@ -2883,6 +2980,8 @@ class ToolCallStreamFilter:
         marker = self._suppressing_until
         if not marker:
             return -1
+        if marker == _LITERAL_CODE_HOLD:
+            return -1
 
         if self._pending_start_marker == _XML_FUNCTION_OPEN:
             end = self._naked_boundary.feed(buffer, self._naked_scan_off)
@@ -2973,15 +3072,12 @@ class ToolCallStreamFilter:
                 marker: str = marker, close: str = close
             ) -> Optional[Tuple[int, int, Optional[str]]]:
                 idx = text.find(marker, start)
-                while idx >= 0 and marker == _GENERIC_TOOL_CALL_START:
-                    literal_context = (
-                        self._in_fenced_code
-                        or self._last_visible_char == "`"
-                        or _generic_marker_in_code_context(text, idx)
-                    )
-                    if not literal_context:
-                        break
-                    idx = text.find(marker, idx + len(marker))
+                if idx >= 0 and marker == _GENERIC_TOOL_CALL_START:
+                    context = self._code_context_tail + text[:idx]
+                    if _generic_marker_in_code_context(
+                        context, len(context), require_close=False
+                    ):
+                        return (idx, len(marker), _LITERAL_CODE_HOLD)
                 return None if idx < 0 else (idx, len(marker), close)
 
             hit = lookup(("pair", marker), compute_pair)
@@ -3291,6 +3387,9 @@ class ToolCallStreamFilter:
         while True:
             if marker == "__suppress_permanently__":
                 self._suppressing = True
+                break
+            if marker == _LITERAL_CODE_HOLD:
+                self._literal_code_candidate = candidate[env_start:]
                 break
             # Same span primitive as the non-streaming parser: a valid JSON or
             # XML payload ends at its structural boundary (so an embedded
