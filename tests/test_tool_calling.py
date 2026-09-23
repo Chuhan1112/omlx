@@ -44,6 +44,7 @@ from omlx.api.tool_calling import (
     extract_json_from_text,
     extract_tool_calls_with_thinking,
     format_tool_call_for_message,
+    literal_code_candidate_is_safe,
     parse_json_output,
     parse_qwen_tool_calls,
     parse_tool_calls,
@@ -5552,9 +5553,13 @@ class TestLiteralGenericToolCallMarkers:
         stream = ToolCallStreamFilter(_make_tokenizer(), tools=self.TOOLS)
 
         visible = _feed_chunked(stream, raw, chunk_size) + stream.finish()
+        candidate = stream.take_literal_code_candidate()
+        recovered = stream.take_recovery_candidate()
         cleaned, calls = parse_tool_calls(raw, _make_tokenizer(), self.TOOLS)
 
-        assert visible == raw
+        assert visible == "Use `"
+        assert candidate == "\x3ctool_call\x3e` literally."
+        assert recovered == ""
         assert cleaned == raw
         assert calls is None
 
@@ -5564,9 +5569,13 @@ class TestLiteralGenericToolCallMarkers:
         stream = ToolCallStreamFilter(_make_tokenizer(), tools=self.TOOLS)
 
         visible = _feed_chunked(stream, raw, chunk_size) + stream.finish()
+        candidate = stream.take_literal_code_candidate()
+        recovered = stream.take_recovery_candidate()
         cleaned, calls = parse_tool_calls(raw, _make_tokenizer(), self.TOOLS)
 
-        assert visible == raw
+        assert visible == "Example:\n```\n"
+        assert candidate == "\x3ctool_call\x3e\nwrite\n```"
+        assert recovered == ""
         assert cleaned == raw
         assert calls is None
 
@@ -5578,12 +5587,50 @@ class TestLiteralGenericToolCallMarkers:
         stream = ToolCallStreamFilter(_make_tokenizer(), tools=self.TOOLS)
 
         visible = _feed_chunked(stream, raw, chunk_size) + stream.finish()
+        candidate = stream.take_literal_code_candidate()
+        recovered = stream.take_recovery_candidate()
         cleaned, calls = parse_tool_calls(raw, _make_tokenizer(), self.TOOLS)
 
-        assert visible == literal + " Done."
+        assert visible == "Use `"
+        assert candidate.startswith("\x3ctool_call\x3e` literally.")
+        assert recovered == ""
         assert cleaned == literal + " Done."
         assert len(calls) == 1
         assert calls[0].function.name == "write"
+
+    def test_thinking_sanitizer_recovers_only_safe_code_marker(self):
+        safe = "Use `\x3ctool_call\x3e` literally."
+        unsafe_cases = [
+            "Use `\x3ctool_call\x3e` literally. \x3ctool_call\x3e{\"name\":",
+            "Use `\x3ctool_call\x3e` literally. <|im_start|>function: execute_code>",
+        ]
+
+        cleaned = sanitize_tool_call_markup(safe, _make_tokenizer(), self.TOOLS)
+        assert cleaned == safe
+        for unsafe in unsafe_cases:
+            cleaned = sanitize_tool_call_markup(
+                unsafe, _make_tokenizer(), self.TOOLS
+            )
+            assert cleaned == "Use `"
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "Use `\x3ctool_call\x3e without a closing backtick",
+            "Example:\n```\n\x3ctool_call\x3e\nwrite without a closing fence",
+        ],
+    )
+    def test_unbalanced_code_context_is_not_literal(self, raw):
+        stream = ToolCallStreamFilter(_make_tokenizer(), tools=self.TOOLS)
+
+        visible = _feed_chunked(stream, raw, 7) + stream.finish()
+        candidate = stream.take_literal_code_candidate()
+        cleaned, calls = parse_tool_calls(raw, _make_tokenizer(), self.TOOLS)
+
+        assert candidate.startswith("\x3ctool_call\x3e")
+        assert "\x3ctool_call\x3e" not in visible
+        assert not literal_code_candidate_is_safe(cleaned)
+        assert calls is None
 
     @pytest.mark.parametrize("chunk_size", [0, 1, 7])
     def test_plain_prose_and_malformed_call_stay_suppressed(self, chunk_size):
