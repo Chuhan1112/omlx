@@ -444,6 +444,30 @@ _XML_FUNCTION_OPEN = "<function="
 _XML_FUNCTION_CLOSE = "</function>"
 _XML_PARAMETER_OPEN = "<parameter="
 _XML_PARAMETER_CLOSE = "</parameter>"
+_GENERIC_TOOL_CALL_START = "<" "tool_call" ">"
+
+
+def _text_in_fenced_code(prefix: str) -> bool:
+    in_fence = False
+    fence_marker = ""
+    for line in prefix.splitlines(keepends=True):
+        stripped = line.lstrip(" \t")
+        if in_fence:
+            if stripped.startswith(fence_marker):
+                in_fence = False
+                fence_marker = ""
+        elif stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = True
+            fence_marker = stripped[:3]
+    return in_fence
+
+
+def _generic_marker_in_code_context(text: str, idx: int) -> bool:
+    if idx > 0 and text[idx - 1] == "`":
+        return True
+    return _text_in_fenced_code(text[:idx])
+
+
 # Candidate envelope ends examined before giving up. Each candidate costs a
 # balance count over the payload, so this keeps hostile output linear.
 _XML_MAX_END_CANDIDATES = 32
@@ -499,6 +523,13 @@ def _wrap_naked_function_calls(text: str) -> str | None:
     pos = 0
     recovered = False
     while match := _QWEN_OPEN_RE.search(text, pos):
+        if (
+            match.group() == _GENERIC_TOOL_CALL_START
+            and _generic_marker_in_code_context(text, match.start())
+        ):
+            parts.append(text[pos : match.end()])
+            pos = match.end()
+            continue
         if match.group() == "<tool_call>":
             found = _find_marker_span_end(text, match.end(), "</tool_call>")
             if found is None:
@@ -773,6 +804,12 @@ def _iter_marker_spans(
         start = text.find(start_marker, pos)
         if start < 0:
             return
+        if (
+            start_marker == _GENERIC_TOOL_CALL_START
+            and _generic_marker_in_code_context(text, start)
+        ):
+            pos = start + len(start_marker)
+            continue
         payload_start = start + len(start_marker)
         found = _find_marker_span_end(text, payload_start, end_marker)
         if found is None:
@@ -2524,6 +2561,10 @@ class ToolCallStreamFilter:
         self._buffer = ""
         self._suppressing_until: Optional[str] = None
         self._suppressing = False
+        self._in_fenced_code = False
+        self._fence_marker = ""
+        self._line_buffer = ""
+        self._last_visible_char = ""
         self._pending_envelope_parts: List[str] = []
         self._pending_start_marker: Optional[str] = None
         self._recovery_candidate = ""
@@ -2595,9 +2636,34 @@ class ToolCallStreamFilter:
             or self._ifm_pending_parts is not None
         )
 
+    def _update_visible_code_context(self, text: str) -> None:
+        """Track the two literal-marker contexts we can identify reliably."""
+
+        for ch in text:
+            self._last_visible_char = ch
+            if self._in_fenced_code:
+                self._line_buffer += ch
+                if ch == "\n":
+                    stripped = self._line_buffer.lstrip(" \t")
+                    if stripped.startswith(self._fence_marker):
+                        self._in_fenced_code = False
+                        self._fence_marker = ""
+                    self._line_buffer = ""
+                continue
+
+            if ch == "\n":
+                stripped = self._line_buffer.lstrip(" \t")
+                if stripped.startswith("```") or stripped.startswith("~~~"):
+                    self._in_fenced_code = True
+                    self._fence_marker = stripped[:3]
+                self._line_buffer = ""
+            else:
+                self._line_buffer += ch
+
     def _record_content(self, out: List[str], text: str) -> None:
         if not text:
             return
+        self._update_visible_code_context(text)
         out.append(text)
         if self._capture_ordered_segments:
             self._ordered_segments.append(ToolCallStreamSegment("content", text))
@@ -2907,6 +2973,15 @@ class ToolCallStreamFilter:
                 marker: str = marker, close: str = close
             ) -> Optional[Tuple[int, int, Optional[str]]]:
                 idx = text.find(marker, start)
+                while idx >= 0 and marker == _GENERIC_TOOL_CALL_START:
+                    literal_context = (
+                        self._in_fenced_code
+                        or self._last_visible_char == "`"
+                        or _generic_marker_in_code_context(text, idx)
+                    )
+                    if not literal_context:
+                        break
+                    idx = text.find(marker, idx + len(marker))
                 return None if idx < 0 else (idx, len(marker), close)
 
             hit = lookup(("pair", marker), compute_pair)

@@ -5360,6 +5360,66 @@ def test_attribute_cdata_does_not_select_an_embedded_dialect(value):
     assert json.loads(calls[0].function.arguments) == {"path": value}
 
 
+class TestLiteralGenericToolCallMarkers:
+    """Narrow #3794 recovery for unambiguous code-display contexts."""
+
+    TOOLS = [{"type": "function", "function": {"name": "write"}}]
+
+    @pytest.mark.parametrize("chunk_size", [0, 1, 7])
+    def test_inline_code_marker_is_preserved(self, chunk_size):
+        raw = "Use `\x3ctool_call\x3e` literally."
+        stream = ToolCallStreamFilter(_make_tokenizer(), tools=self.TOOLS)
+
+        visible = _feed_chunked(stream, raw, chunk_size) + stream.finish()
+        cleaned, calls = parse_tool_calls(raw, _make_tokenizer(), self.TOOLS)
+
+        assert visible == raw
+        assert cleaned == raw
+        assert calls is None
+
+    @pytest.mark.parametrize("chunk_size", [0, 1, 7])
+    def test_fenced_code_marker_is_preserved(self, chunk_size):
+        raw = "Example:\n```\n\x3ctool_call\x3e\nwrite\n```"
+        stream = ToolCallStreamFilter(_make_tokenizer(), tools=self.TOOLS)
+
+        visible = _feed_chunked(stream, raw, chunk_size) + stream.finish()
+        cleaned, calls = parse_tool_calls(raw, _make_tokenizer(), self.TOOLS)
+
+        assert visible == raw
+        assert cleaned == raw
+        assert calls is None
+
+    @pytest.mark.parametrize("chunk_size", [0, 1, 7])
+    def test_code_marker_does_not_hide_later_call(self, chunk_size):
+        literal = "Use `\x3ctool_call\x3e` literally. "
+        call = '\x3ctool_call\x3e{"name":"write","arguments":{}}\x3c/tool_call\x3e'
+        raw = literal + call + " Done."
+        stream = ToolCallStreamFilter(_make_tokenizer(), tools=self.TOOLS)
+
+        visible = _feed_chunked(stream, raw, chunk_size) + stream.finish()
+        cleaned, calls = parse_tool_calls(raw, _make_tokenizer(), self.TOOLS)
+
+        assert visible == literal + " Done."
+        assert cleaned == literal + " Done."
+        assert len(calls) == 1
+        assert calls[0].function.name == "write"
+
+    @pytest.mark.parametrize("chunk_size", [0, 1, 7])
+    def test_plain_prose_and_malformed_call_stay_suppressed(self, chunk_size):
+        prose = "The \x3ctool_call\x3e marker starts a call."
+        malformed = '\x3ctool_call\x3e{"name":'
+
+        stream = ToolCallStreamFilter(_make_tokenizer(), tools=self.TOOLS)
+        visible = _feed_chunked(stream, prose, chunk_size) + stream.finish()
+        assert visible == "The "
+        assert stream.take_recovery_candidate() == "\x3ctool_call\x3e marker starts a call."
+
+        stream = ToolCallStreamFilter(_make_tokenizer(), tools=self.TOOLS)
+        visible = _feed_chunked(stream, malformed, chunk_size) + stream.finish()
+        assert visible == ""
+        assert stream.take_recovery_candidate() == malformed
+
+
 @pytest.mark.parametrize("dialect", ["json", "qwen", "namespaced"])
 def test_attribute_example_does_not_override_outer_dialect(dialect):
     value = TestAttributeStyleFunctionDialect.BARE_CALL
