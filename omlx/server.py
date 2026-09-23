@@ -177,7 +177,7 @@ from .api.tool_calling import (
     convert_tools_for_template,
     enrich_tool_params_for_gemma4,
     extract_tool_calls_with_thinking,
-    literal_code_candidate_is_safe,
+    literal_code_recovery_suffix,
     parse_json_output,
     parse_qwen_tool_calls,
     restore_gemma4_param_names,
@@ -6354,12 +6354,12 @@ async def stream_chat_completion(
     literal_thinking_candidate = (
         thinking_filter.take_literal_code_candidate() if thinking_filter else ""
     )
-    literal_recovered_thinking = _literal_code_recovery(
-        cleaned_thinking,
-        streamed_thinking,
-        literal_thinking_candidate,
-        bool(tool_failure),
-        "thinking",
+    literal_recovered_thinking = (
+        literal_code_recovery_suffix(
+            cleaned_thinking, streamed_thinking, bool(tool_failure)
+        )
+        if literal_thinking_candidate
+        else ""
     )
     if literal_recovered_thinking:
         chunk = ChatCompletionChunk(
@@ -6381,13 +6381,11 @@ async def stream_chat_completion(
         tool_filter.take_literal_code_candidate() if tool_filter else ""
     )
     literal_recovered_content = (
-        _literal_code_recovery(
-            cleaned_text,
-            streamed_content,
-            literal_code_candidate if stream_content else "",
-            bool(tool_failure),
-            "content",
+        literal_code_recovery_suffix(
+            cleaned_text, streamed_content, bool(tool_failure)
         )
+        if stream_content and literal_code_candidate
+        else ""
     )
     if literal_recovered_content:
         chunk = ChatCompletionChunk(
@@ -6983,12 +6981,12 @@ async def stream_anthropic_messages(
     literal_thinking_candidate = (
         thinking_filter.take_literal_code_candidate() if thinking_filter else ""
     )
-    literal_recovered_thinking = _literal_code_recovery(
-        cleaned_thinking,
-        streamed_thinking,
-        literal_thinking_candidate,
-        bool(tool_failure),
-        "thinking",
+    literal_recovered_thinking = (
+        literal_code_recovery_suffix(
+            cleaned_thinking, streamed_thinking, bool(tool_failure)
+        )
+        if literal_thinking_candidate
+        else ""
     )
     if literal_recovered_thinking:
         if text_block_started:
@@ -7006,12 +7004,12 @@ async def stream_anthropic_messages(
     literal_code_candidate = (
         tool_filter.take_literal_code_candidate() if tool_filter else ""
     )
-    literal_recovered_content = _literal_code_recovery(
-        cleaned_text,
-        streamed_content,
-        literal_code_candidate,
-        bool(tool_failure),
-        "content",
+    literal_recovered_content = (
+        literal_code_recovery_suffix(
+            cleaned_text, streamed_content, bool(tool_failure)
+        )
+        if literal_code_candidate
+        else ""
     )
     if literal_recovered_content:
         if thinking_block_started and not text_block_started:
@@ -8925,12 +8923,12 @@ async def stream_responses_api(
     literal_thinking_candidate = (
         thinking_filter.take_literal_code_candidate() if thinking_filter else ""
     )
-    literal_recovered_thinking = _literal_code_recovery(
-        cleaned_thinking,
-        accumulated_reasoning,
-        literal_thinking_candidate,
-        bool(tool_failure),
-        "thinking",
+    literal_recovered_thinking = (
+        literal_code_recovery_suffix(
+            cleaned_thinking, accumulated_reasoning, bool(tool_failure)
+        )
+        if literal_thinking_candidate
+        else ""
     )
     if literal_recovered_thinking and not reasoning_closed:
         for ev in _emit_reasoning_delta(literal_recovered_thinking):
@@ -8943,12 +8941,12 @@ async def stream_responses_api(
     literal_code_candidate = (
         tool_filter.take_literal_code_candidate() if tool_filter else ""
     )
-    literal_recovered_content = _literal_code_recovery(
-        cleaned_text,
-        streamed_content,
-        literal_code_candidate if stream_content else "",
-        bool(tool_failure),
-        "content",
+    literal_recovered_content = (
+        literal_code_recovery_suffix(
+            cleaned_text, streamed_content, bool(tool_failure)
+        )
+        if stream_content and literal_code_candidate
+        else ""
     )
     if literal_recovered_content:
         if reasoning_opened and not reasoning_closed:
